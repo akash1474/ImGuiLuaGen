@@ -66,7 +66,7 @@ from clang.cindex import TypeKind as TyK
 import datetime
 import pprint
 
-# Functions/types to skip during generation. USR is a Unique Symbol Resolution identifier from clang.
+# Functions/types to skip during generation by name.
 skip_names = [
     "SetAllocatorFunctions",
     "MemAlloc",
@@ -83,6 +83,7 @@ skip_names = [
     "ImTextureData_GetTexRef",
 ]
 
+# Functions/types to skip during generation using their Unique Symbol Resolution (USR) identifier from clang.
 skip_usrs = [
     # we have custom replacements:
     "c:@N@ImGui@F@CreateContext#*$@S@ImFontAtlas#",
@@ -101,16 +102,20 @@ skip_usrs = [
     "c:@S@ImFontGlyphRangesBuilder@F@BuildRanges#*$@S@ImVector>#s#",  # Template parameter in function
 ]
 
+# Structs for which constructor generation should be skipped.
 skip_constructors = ["ImGuiTextFilter", "ImDrawList"]
 
+# Flag to enable/disable debug information in generated files.
 debug = False
 
 # do not change below
 
+# Caches file contents to avoid reading the same file multiple times.
 fileCache = {}
 
-# dumps a cursor to the screen, recursively
+
 def dumpCursor(c, level):
+    """Recursively prints the details of a clang cursor for debugging."""
     print(
         " " * level,
         str(c.kind)[str(c.kind).index(".") + 1 :],
@@ -122,8 +127,17 @@ def dumpCursor(c, level):
         dumpCursor(cn, level + 1)
 
 
-# gets the content for that cursor from the file
 def getContent(c, shortOnly):
+    """
+    Extracts the source code text corresponding to a clang cursor.
+    
+    Args:
+        c: The clang cursor.
+        shortOnly (bool): If True, returns '<>' for multi-line content.
+    
+    Returns:
+        The source text as a string.
+    """
     global fileCache
     filename = str(c.extent.start.file)
     if filename == "None":
@@ -155,30 +169,23 @@ def getContent(c, shortOnly):
     return res.strip()
 
 
-# this function prevents lua parameters being lua keywords
 def luaParameterSpelling(c, addSimpleType):
+    """
+    Sanitizes a parameter name to avoid conflicts with Lua keywords.
+    Optionally prefixes the name with a simplified type for clarity in the Lua API.
+    
+    Args:
+        c: The clang cursor for the parameter.
+        addSimpleType (bool): Whether to add the type prefix.
+        
+    Returns:
+        The sanitized parameter name.
+    """
     reserved_lua_keywords = {
-        "and": 1,
-        "break": 1,
-        "do": 1,
-        "else": 1,
-        "elseif": 1,
-        "end": 1,
-        "false": 1,
-        "for": 1,
-        "function": 1,
-        "if": 1,
-        "in": 1,
-        "local": 1,
-        "nil": 1,
-        "not": 1,
-        "or": 1,
-        "repeat": 1,
-        "return": 1,
-        "then": 1,
-        "true": 1,
-        "until": 1,
-        "while": 1,
+        "and": 1, "break": 1, "do": 1, "else": 1, "elseif": 1, "end": 1,
+        "false": 1, "for": 1, "function": 1, "if": 1, "in": 1, "local": 1,
+        "nil": 1, "not": 1, "or": 1, "repeat": 1, "return": 1, "then": 1,
+        "true": 1, "until": 1, "while": 1,
     }
     parName = c.spelling
     if not parName:
@@ -208,8 +215,19 @@ def luaParameterSpelling(c, addSimpleType):
         return parName
 
 
-# fixes up some variable naming and type things
 def getCVarStr(c, addSimpleType, is_ffi_header=False):
+    """
+    Constructs a C-style variable declaration string (e.g., "int my_var") from a cursor.
+    Handles special type replacements for FFI compatibility.
+
+    Args:
+        c: The clang cursor for the variable/parameter.
+        addSimpleType (bool): Passed to luaParameterSpelling for name generation.
+        is_ffi_header (bool): If True, replaces ImVec2/ImVec4 with their _C counterparts.
+    
+    Returns:
+        A C variable declaration string.
+    """
     res = ""
     # Special handling for ImTextureRef to pass it as ImTextureID (ImU64) through FFI
     if c.type.spelling == "ImTextureRef":
@@ -217,7 +235,7 @@ def getCVarStr(c, addSimpleType, is_ffi_header=False):
     else:
         type_str = c.type.spelling
 
-    # FIX: Conditionally replace types ONLY for the FFI header file
+    # Conditionally replace types ONLY for the FFI header file
     if is_ffi_header:
         if "ImVec2" in type_str:
             type_str = type_str.replace("ImVec2", "ImVec2_C")
@@ -243,6 +261,7 @@ def getCVarStr(c, addSimpleType, is_ffi_header=False):
 
 
 def stripSizeOf(s):
+    """Removes 'sizeof()' wrapper from a string, returning only the type name inside."""
     i = 0
     for c in s:
         if c == "(":
@@ -258,8 +277,17 @@ def stripSizeOf(s):
     return s
 
 
-# converts a c value to a lua value - used for optional arguments
 def luaifyValueWithType(p, s):
+    """
+    Converts a C default value string into its Lua equivalent based on the parameter's type.
+    
+    Args:
+        p: The clang cursor for the parameter.
+        s (str): The C default value string.
+        
+    Returns:
+        The Lua equivalent value string.
+    """
     t = p.type
     k = t.kind
 
@@ -280,7 +308,7 @@ def luaifyValueWithType(p, s):
     ):
         s = s.replace("+", "")
         if s.startswith("Im"):
-            # Split by | and handle each part
+            # Split by | and handle each part for flags
             parts = [part.strip() for part in s.split("|")]
             lua_parts = []
             for part in parts:
@@ -305,7 +333,6 @@ def luaifyValueWithType(p, s):
     elif k == TyK.LVALUEREFERENCE or k == TyK.RECORD or k == TyK.POINTER:
         # Handle C++ constructor calls like ImVec2(0,0)
         if s.startswith("ImVec2"):
-            # FIXED: Generate ffi.new() for struct pointers
             params = s[s.find("(") + 1 : s.find(")")]
             params = params.replace("f", "")
             return f'ffi.new("ImVec2_C", {params})'
@@ -315,33 +342,35 @@ def luaifyValueWithType(p, s):
             return f'ffi.new("ImVec4_C", {params})'
         return "M." + s
     else:
-        print(
-            f"unknown value type:  {k} {s}  ### parent =  {p.type.spelling}  {p.spelling}"
-        )
+        print(f"unknown value type:  {k} {s}  ### parent =  {p.type.spelling}  {p.spelling}")
     return s
 
 
-# converts a c value to a lua value - used for optional arguments
 def luaifyValue(cParent, s):
+    """Alias for luaifyValueWithType."""
     return luaifyValueWithType(cParent, s)
 
 
 def getLuaFunctionOptionalParams(c):
+    """
+    Parses a function's tokens to extract default parameter values.
+    
+    Args:
+        c: The clang cursor for the function.
+        
+    Returns:
+        A dictionary mapping sanitized parameter names to their Lua-ified default values,
+        or None if there are no optional parameters.
+    """
     parameter_opt = None
     token = list(c.get_tokens())
     for p in c.get_arguments():
         for i in range(0, len(token)):
-            if (
-                token[i].kind == TK.IDENTIFIER
-                and token[i].spelling == p.spelling
-                and i < len(token) - 2
-            ):
+            if (token[i].kind == TK.IDENTIFIER and token[i].spelling == p.spelling and
+                    i < len(token) - 2):
                 i += 1
-                if (
-                    token[i].kind == TK.PUNCTUATION
-                    and token[i].spelling == "="
-                    and i < len(token) - 2
-                ):
+                if (token[i].kind == TK.PUNCTUATION and token[i].spelling == "=" and
+                        i < len(token) - 2):
                     i += 1
                     braceStack = 0
                     start_token_index = i
@@ -362,7 +391,7 @@ def getLuaFunctionOptionalParams(c):
 
                     # Reconstruct the default argument string from tokens
                     optArg = " ".join(t.spelling for t in token[start_token_index:i])
-
+                    
                     # Post-process to fix spacing issues
                     optArg = (
                         optArg.replace(" (", "(")
@@ -388,12 +417,19 @@ def getLuaFunctionOptionalParams(c):
 
 
 class BindingGenerator:
+    """
+    Main class that traverses the Clang AST and generates bindings.
+    It produces three files:
+    1. C Header (imgui_gen.h): For LuaJIT FFI to define C types.
+    2. C++ Host (imguiApiHostGenerated.cpp): The C++ implementation of wrapped functions.
+    3. Lua Module (imgui_gen.lua): The Lua wrapper with helpers for optional arguments.
+    """
     def __init__(self, debug):
         self.functionRenames = {}
         self.debug = debug
 
-    ## structs
     def _generateCVMStruct(self, c, level):
+        """Generates the C struct/union definition for the FFI header file."""
         functionCache = ""
         res = ""
         if c.kind == CK.STRUCT_DECL:
@@ -407,42 +443,19 @@ class BindingGenerator:
         for ch in c.get_children():
             if ch.kind == CK.FIELD_DECL:
                 if ch.type.spelling.find("(") >= 0:
-                    res += (
-                        "  " * (level + 1)
-                        + "void* "
-                        + ch.spelling
-                        + "; // complex callback: "
-                        + ch.type.spelling
-                        + " - "
-                        + self.getCursorDebug(ch, "")
-                        + "\n"
-                    )
+                    res += "  " * (level + 1) + "void* " + ch.spelling + "; // complex callback: " + ch.type.spelling + " - " + self.getCursorDebug(ch, "") + "\n"
                 else:
-                    res += (
-                        "  " * (level + 1)
-                        + getCVarStr(ch, False, is_ffi_header=True)
-                        + ";"
-                        + self.getCursorDebug(ch, "   // ")
-                        + "\n"
-                    )
+                    res += "  " * (level + 1) + getCVarStr(ch, False, is_ffi_header=True) + ";" + self.getCursorDebug(ch, "   // ") + "\n"
             elif ch.kind == CK.CONSTRUCTOR and level == 0:
                 functionCache += "// " + self._generateCVMFunction(ch, "imgui_", None)
             elif ch.kind == CK.STRUCT_DECL or ch.kind == CK.UNION_DECL:
                 res += "  " * (level + 1) + self.getCursorDebug(ch, " // ") + "\n"
                 res += self._generateCVMStruct(ch, level + 1)
-            elif (
-                (ch.kind == CK.FUNCTION_DECL or ch.kind == CK.CXX_METHOD)
-                and ch.spelling.find("operator") == -1
-                and level == 0
-            ):
+            elif (ch.kind == CK.FUNCTION_DECL or ch.kind == CK.CXX_METHOD) and ch.spelling.find("operator") == -1 and level == 0:
                 if ch.get_usr() in skip_usrs or ch.spelling in skip_names:
                     pass
                 else:
-                    functionCache += self._generateCVMFunction(
-                        ch,
-                        "imgui_" + c.spelling + "_",
-                        c.spelling + "* " + c.spelling + "_ctx",
-                    )
+                    functionCache += self._generateCVMFunction(ch, "imgui_" + c.spelling + "_", c.spelling + "* " + c.spelling + "_ctx")
 
         if c.kind == CK.STRUCT_DECL:
             if level == 0:
@@ -454,29 +467,17 @@ class BindingGenerator:
         res += functionCache
         return res
 
-    ## struct member functions
     def _generateLVMStruct(self, c):
+        """Generates Lua wrapper functions for a struct's methods."""
         if debug:
             res = "--=== struct " + c.spelling + " === " + c.get_usr() + "\n"
         else:
             res = "--=== struct " + c.spelling + " ===\n"
         for ch in c.get_children():
-            if (
-                ch.get_usr() in skip_usrs
-                or ch.spelling in skip_names
-                or ch.kind == CK.CLASS_TEMPLATE
-                or ch.kind == CK.FUNCTION_TEMPLATE
-            ):
+            if ch.get_usr() in skip_usrs or ch.spelling in skip_names or ch.kind == CK.CLASS_TEMPLATE or ch.kind == CK.FUNCTION_TEMPLATE:
                 continue
-            if (
-                ch.kind == CK.FUNCTION_DECL or ch.kind == CK.CXX_METHOD
-            ) and ch.spelling.find("operator") == -1:
-                res += self._generateLuaVMFunction(
-                    ch,
-                    c.spelling + "_",
-                    "imgui_" + c.spelling + "_",
-                    c.spelling + "_ctx",
-                )
+            if (ch.kind == CK.FUNCTION_DECL or ch.kind == CK.CXX_METHOD) and ch.spelling.find("operator") == -1:
+                res += self._generateLuaVMFunction(ch, c.spelling + "_", "imgui_" + c.spelling + "_", c.spelling + "_ctx")
             elif ch.kind == CK.CONSTRUCTOR:
                 if ch.spelling in skip_constructors:
                     continue
@@ -486,37 +487,18 @@ class BindingGenerator:
         return res
 
     def _generateCHostStruct(self, c):
+        """Generates the C++ host implementation for a struct's methods."""
         res = ""
         for ch in c.get_children():
-            if (
-                ch.get_usr() in skip_usrs
-                or ch.spelling in skip_names
-                or ch.kind == CK.CLASS_TEMPLATE
-                or ch.kind == CK.FUNCTION_TEMPLATE
-            ):
+            if ch.get_usr() in skip_usrs or ch.spelling in skip_names or ch.kind == CK.CLASS_TEMPLATE or ch.kind == CK.FUNCTION_TEMPLATE:
                 continue
-            if (
-                ch.kind == CK.FUNCTION_DECL or ch.kind == CK.CXX_METHOD
-            ) and ch.spelling.find("operator") == -1:
-                res += self._generateCHostFunction(
-                    ch,
-                    "imgui_" + c.spelling + "_",
-                    c.spelling + "_ctx->",
-                    c.spelling + "_ctx",
-                    c.type.spelling,
-                )
+            if (ch.kind == CK.FUNCTION_DECL or ch.kind == CK.CXX_METHOD) and ch.spelling.find("operator") == -1:
+                res += self._generateCHostFunction(ch, "imgui_" + c.spelling + "_", c.spelling + "_ctx->", c.spelling + "_ctx", c.type.spelling)
         return res
 
-    ## LVM Constructors
     def _generateLuaConstructor(self, c):
-        (
-            signature,
-            resStr,
-            parameter_names,
-            isVariadic,
-            parameter_deref,
-            parameter_wrappers,
-        ) = self.getCFunctionSignature(c, "", None, False)
+        """Generates a Lua helper function to construct a C struct via ffi.new."""
+        signature, resStr, parameter_names, isVariadic, parameter_deref, parameter_wrappers = self.getCFunctionSignature(c, "", None, False)
         i = 0
         for param in parameter_names:
             if param and param[0] == "_":
@@ -536,26 +518,18 @@ class BindingGenerator:
         funcPtr += "end\n"
         return func + funcPtr
 
-    ## functions
     def _generateCVMFunction(self, c, prefix, firstArg):
-        signature, _, _, _, _, _ = self.getCFunctionSignature(
-            c, prefix, firstArg, False, is_ffi_header=True
-        )
+        """Generates the C function declaration for the FFI header."""
+        signature, _, _, _, _, _ = self.getCFunctionSignature(c, prefix, firstArg, False, is_ffi_header=True)
         return signature + ";" + self.getCursorDebug(c, "   // ") + "\n"
 
     def _generateCHostFunction(self, c, prefix, cNamespace, firstArgName, firstArgType):
+        """Generates the C++ host implementation of a wrapped function."""
         firstArg = None
         functionAppendix = ""
         if firstArgName and firstArgType:
             firstArg = firstArgType + "* " + firstArgName
-        (
-            signature,
-            resStr,
-            parameter_names,
-            isVariadic,
-            parameter_deref,
-            parameter_wrappers,
-        ) = self.getCFunctionSignature(c, prefix, firstArg, True)
+        signature, resStr, parameter_names, isVariadic, parameter_deref, parameter_wrappers = self.getCFunctionSignature(c, prefix, firstArg, True)
         res = ""
         if self.debug:
             res += "\n" + self.getCursorDebug(c, "// ") + "\n"
@@ -588,9 +562,9 @@ class BindingGenerator:
         rt = c.result_type
         if c.result_type.kind == TyK.TYPEDEF:
             rt = c.result_type.get_canonical()
-
+        
         call_str = cNamespace + c.spelling + functionAppendix + "(" + paramStr + ")"
-
+        
         if rt.spelling == "ImVec2":
             res += f"  const ImVec2& res_cxx = {call_str};\n"
             res += "  ImVec2_C res_c = {res_cxx.x, res_cxx.y};\n"
@@ -607,14 +581,8 @@ class BindingGenerator:
         return res
 
     def _generateLuaVMFunction(self, c, prefixLua, prefixC, firstArg):
-        (
-            signature,
-            resStr,
-            parameter_names,
-            isVariadic,
-            parameter_deref,
-            _,
-        ) = self.getCFunctionSignature(c, "imgui_", None, False)
+        """Generates the Lua wrapper function, handling default arguments."""
+        signature, resStr, parameter_names, isVariadic, parameter_deref, _ = self.getCFunctionSignature(c, "imgui_", None, False)
         parameters = []
         parameter_opt = getLuaFunctionOptionalParams(c)
         parameter_PtrChecks = {}
@@ -638,14 +606,7 @@ class BindingGenerator:
         if self.debug:
             res += "\n" + self.getCursorDebug(c, "-- ") + "\n"
             multiLineFunction = True
-        res += (
-            "function M."
-            + prefixLua
-            + self.getFunctionName(c)
-            + "("
-            + ", ".join(parameters)
-            + ") "
-        )
+        res += "function M." + prefixLua + self.getFunctionName(c) + "(" + ", ".join(parameters) + ") "
         if parameter_opt:
             multiLineFunction = True
             res += "\n"
@@ -664,17 +625,7 @@ class BindingGenerator:
             for k, v in parameter_PtrChecks.items():
                 if parameter_opt and k in parameter_opt and parameter_opt[k] == "nil":
                     continue
-                res += (
-                    "  if "
-                    + k
-                    + ' == nil then log("E", "", "Parameter \''
-                    + k
-                    + "' of function '"
-                    + self.getFunctionName(c)
-                    + "' cannot be nil, as the c type is '"
-                    + v
-                    + "'\") ; return end\n"
-                )
+                res += "  if " + k + ' == nil then log("E", "", "Parameter \'' + k + "' of function '" + self.getFunctionName(c) + "' cannot be nil, as the c type is '" + v + "'\") ; return end\n"
 
         if debug:
             res += "\n"
@@ -683,36 +634,22 @@ class BindingGenerator:
                 if p == "...":
                     p = "{...}"
                 parameters2.append('" .. dumps(' + p + ') .. "')
-            res += (
-                '  print("*** calling FFI: '
-                + prefixC
-                + self.getFunctionName(c)
-                + "("
-                + (", ".join(parameters2))
-                + ')")\n'
-            )
+            res += '  print("*** calling FFI: ' + prefixC + self.getFunctionName(c) + "(" + (", ".join(parameters2)) + ')")\n'
 
         if multiLineFunction:
             res += "  "
 
         if c.result_type.spelling != "void":
             res += "return "
-        res += (
-            "C."
-            + prefixC
-            + self.getFunctionName(c)
-            + "("
-            + ", ".join(lua_call_params)
-            + ")"
-        )
+        res += "C." + prefixC + self.getFunctionName(c) + "(" + ", ".join(lua_call_params) + ")"
         if multiLineFunction:
             res += "\nend\n"
         else:
             res += " end\n"
         return res
 
-    ## enums
     def _generateCVMEnum(self, c):
+        """Generates a C enum or typedef for the FFI header."""
         name = c.spelling
         constants = []
         for ch in c.get_children():
@@ -731,6 +668,7 @@ class BindingGenerator:
         return res
 
     def _generateLVMEnum(self, c):
+        """Generates Lua variables for each enum constant."""
         res = "--=== enum " + c.spelling + " ===\n"
         for ch in c.get_children():
             if ch.kind == CK.ENUM_CONSTANT_DECL:
@@ -741,26 +679,25 @@ class BindingGenerator:
         res += "--===\n"
         return res
 
-    ## main
     def _traverse(self, c, level):
+        """
+        Recursively traverses the AST, calling the appropriate generator for each node.
+        
+        Args:
+            c: The current clang cursor.
+            level (int): The current depth in the AST.
+        """
         if c.location.file and not c.location.file.name.endswith(self.sFilename):
             return
 
-        if (
-            c.get_usr() in skip_usrs
-            or c.spelling in skip_names
-            or c.kind == CK.CLASS_TEMPLATE
-            or c.kind == CK.FUNCTION_TEMPLATE
-        ):
+        if c.get_usr() in skip_usrs or c.spelling in skip_names or c.kind == CK.CLASS_TEMPLATE or c.kind == CK.FUNCTION_TEMPLATE:
             return
 
         if c.kind == CK.FUNCTION_DECL or c.kind == CK.CXX_METHOD:
             if c.spelling.find("operator") == 0:
                 return
             self.tVMFile.write(self._generateCVMFunction(c, "imgui_", None))
-            self.tHostFile.write(
-                self._generateCHostFunction(c, "imgui_", "ImGui::", None, None)
-            )
+            self.tHostFile.write(self._generateCHostFunction(c, "imgui_", "ImGui::", None, None))
             self.tLuaFile.write(self._generateLuaVMFunction(c, "", "imgui_", None))
             return
         elif c.kind == CK.TYPEDEF_DECL:
@@ -773,9 +710,7 @@ class BindingGenerator:
                 self.tHostFile.write(self._generateCHostStruct(c))
                 self.tLuaFile.write(self._generateLVMStruct(c))
             else:
-                self.tVMFile.write(
-                    "typedef struct " + c.spelling + " " + c.spelling + ";\n"
-                )
+                self.tVMFile.write("typedef struct " + c.spelling + " " + c.spelling + ";\n")
             return
         elif c.kind == CK.ENUM_DECL:
             self.tVMFile.write(self._generateCVMEnum(c))
@@ -784,28 +719,27 @@ class BindingGenerator:
         elif c.kind == CK.TRANSLATION_UNIT or c.kind == CK.NAMESPACE:
             pass
         else:
-            print(
-                "* unhandled item: " + " " * level,
-                str(c.kind)[str(c.kind).index(".") + 1 :],
-                c.type.spelling,
-                c.spelling,
-            )
+            print("* unhandled item: " + " " * level, str(c.kind)[str(c.kind).index(".") + 1 :], c.type.spelling, c.spelling)
             print(" " * level, "  ", getContent(c, True))
 
         for cn in c.get_children():
             self._traverse(cn, level + 1)
 
     def generate(self, c, sFilename):
+        """
+        Main generation method. Sets up output files and starts the AST traversal.
+        
+        Args:
+            c: The root cursor of the translation unit.
+            sFilename (str): The name of the input header file.
+        """
         self.sFilename = sFilename
         outDir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "generated")
         if not os.path.exists(outDir):
             os.mkdir(outDir)
 
-        with open(
-            os.path.join(outDir, "imgui_gen.lua"), "w", encoding="utf-8"
-        ) as self.tLuaFile:
-            self.tLuaFile.write(
-                """-- !!!! DO NOT EDIT THIS FILE -- It was automatically generated by gen.py -- DO NOT EDIT THIS FILE !!!!
+        with open(os.path.join(outDir, "imgui_gen.lua"), "w", encoding='utf-8') as self.tLuaFile:
+            self.tLuaFile.write("""-- !!!! DO NOT EDIT THIS FILE -- It was automatically generated by gen.py -- DO NOT EDIT THIS FILE !!!!
 
 local ffi = require('ffi')
 local C -- Will be initialized with the library
@@ -818,13 +752,9 @@ local FLT_MIN = -3.402823466e+38
 function M.init(lib)
     C = lib
 
-"""
-            )
-            with open(
-                os.path.join(outDir, "imgui_gen.h"), "w", encoding="utf-8"
-            ) as self.tVMFile:
-                self.tVMFile.write(
-                    """///////////////////////////////////////////////////////////////////////////////
+""")
+            with open(os.path.join(outDir, "imgui_gen.h"), "w", encoding='utf-8') as self.tVMFile:
+                self.tVMFile.write("""///////////////////////////////////////////////////////////////////////////////
 // this file is used for declaring C types for LuaJIT's FFI. Do not use it in C
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -842,15 +772,9 @@ typedef struct { float x, y, z, w; } ImVec4_C;
 // Typedef for ImTextureID for FFI, as ImGui uses ImU64
 typedef unsigned long long ImTextureID;
 
-"""
-                )
-                with open(
-                    os.path.join(outDir, "imguiApiHostGenerated.cpp"),
-                    "w",
-                    encoding="utf-8",
-                ) as self.tHostFile:
-                    self.tHostFile.write(
-                        """// !!!! DO NOT EDIT THIS FILE -- It was automatically generated by gen.py -- DO NOT EDIT THIS FILE !!!!
+""")
+                with open(os.path.join(outDir, "imguiApiHostGenerated.cpp"), "w", encoding='utf-8') as self.tHostFile:
+                    self.tHostFile.write("""// !!!! DO NOT EDIT THIS FILE -- It was automatically generated by gen.py -- DO NOT EDIT THIS FILE !!!!
 
 #if defined(BNG_VERSION)
   #include "imguiApiHost.h"
@@ -879,31 +803,28 @@ extern "C" {
   typedef ImU64 ImTextureID;
 #endif // STANDALONE
 
-"""
-                    )
+""")
                     self.detectOverloads(c)
                     self._traverse(c, 0)
-                    self.tHostFile.write(
-                        """
+                    self.tHostFile.write("""
 
 #undef FFI_EXPORT
 } // extern C
-"""
-                    )
-            self.tLuaFile.write(
-                """
+""")
+            self.tLuaFile.write("""
 end
 return M
-"""
-            )
+""")
 
     def getCursorDebug(self, c, prefix):
+        """Returns the cursor's USR for debugging purposes if debug mode is enabled."""
         if not self.debug:
             return ""
         else:
             return prefix + c.get_usr()
 
     def getFunctionName(self, c):
+        """Gets the function name, using a renamed version if it's an overload."""
         u = c.get_usr()
         if u in self.functionRenames:
             return self.functionRenames[u]
@@ -911,6 +832,10 @@ return M
             return c.spelling
 
     def detectOverloads(self, c):
+        """
+        Top-level function to find and record overloaded functions.
+        This populates self.functionRenames to give overloads unique names (e.g., myFunction1, myFunction2).
+        """
         fctCache = {}
         self._rec_detectOverloads(fctCache, c, 0, "")
         for k in list(fctCache.keys()):
@@ -921,11 +846,8 @@ return M
                 self.functionRenames[v[i].get_usr()] = v[i].spelling + str(i + 1)
 
     def _rec_detectOverloads(self, fctCache, c, level, prefix):
-        if (
-            c.kind == CK.STRUCT_DECL
-            or c.kind == CK.TRANSLATION_UNIT
-            or c.kind == CK.NAMESPACE
-        ):
+        """Recursively traverses the AST to find functions with the same name."""
+        if c.kind == CK.STRUCT_DECL or c.kind == CK.TRANSLATION_UNIT or c.kind == CK.NAMESPACE:
             prefix += c.spelling + "_"
         elif c.kind == CK.FUNCTION_DECL or c.kind == CK.CXX_METHOD:
             if c.spelling.find("operator") == 0:
@@ -945,6 +867,20 @@ return M
             self._rec_detectOverloads(fctCache, cn, level, prefix)
 
     def getCFunctionSignature(self, c, prefix, firstArg, isHost, is_ffi_header=False):
+        """
+        Constructs the full C function signature and extracts parameter details.
+        
+        Args:
+            c: The function cursor.
+            prefix (str): Prefix for the function name (e.g., "imgui_").
+            firstArg (str): An optional first argument to prepend (for member functions).
+            isHost (bool): True if generating for the C++ host, affects type conversions.
+            is_ffi_header (bool): True if generating for the FFI header.
+        
+        Returns:
+            A tuple containing: (signature_string, return_string, param_names,
+                                is_variadic, param_deref_flags, param_wrappers).
+        """
         parameters = []
         parameter_names = []
         parameter_deref = []
@@ -953,12 +889,10 @@ return M
 
         for p in c.get_arguments():
             parameters.append(getCVarStr(p, False, is_ffi_header=is_ffi_header))
-            dereferenceRequired = (
-                p.type.kind == TyK.LVALUEREFERENCE or p.type.spelling.endswith(" &")
-            )
+            dereferenceRequired = p.type.kind == TyK.LVALUEREFERENCE or p.type.spelling.endswith(" &")
             parameter_names.append(luaParameterSpelling(p, False))
             parameter_deref.append(dereferenceRequired)
-
+            
             # Special handling for ImTextureRef for the C++ host wrapper
             if isHost and p.type.spelling == "ImTextureRef":
                 parameter_wrappers.append(("ImTextureRef(", ")"))
@@ -979,35 +913,18 @@ return M
         if isHost:
             if effectiveReturnType.spelling == "ImVec2":
                 resType = "ImVec2_C"
-            elif (
-                effectiveReturnType.spelling == "ImVec4"
-                or effectiveReturnType.spelling == "ImColor"
-            ):
+            elif effectiveReturnType.spelling == "ImVec4" or effectiveReturnType.spelling == "ImColor":
                 resType = "ImVec4_C"
 
         if resType == "void":
             resStr = ""
 
-        signature = (
-            resType
-            + " "
-            + prefix
-            + self.getFunctionName(c)
-            + "("
-            + ", ".join(parameters)
-            + ")"
-        )
-        return (
-            signature,
-            resStr,
-            parameter_names,
-            isVariadic,
-            parameter_deref,
-            parameter_wrappers,
-        )
+        signature = resType + " " + prefix + self.getFunctionName(c) + "(" + ", ".join(parameters) + ")"
+        return signature, resStr, parameter_names, isVariadic, parameter_deref, parameter_wrappers
 
 
 def main():
+    """Main execution entry point."""
     if len(sys.argv) != 2:
         print("Usage: gen.py [input]")
         print("Example: gen.py imgui.h")
@@ -1022,18 +939,13 @@ def main():
     # Use clang to parse
     try:
         if os.name == "nt":
-            # On Windows, add the default LLVM path to the system PATH if it's not there
+            # On Windows, add the default LLVM path to the system PATH to find libclang.dll
             llvm_path = "C:/Program Files/LLVM/bin"
             if os.path.exists(os.path.join(llvm_path, "libclang.dll")):
                 os.environ["PATH"] = llvm_path + os.pathsep + os.environ["PATH"]
-                clang.cindex.Config.set_library_file(
-                    os.path.join(llvm_path, "libclang.dll")
-                )
+                clang.cindex.Config.set_library_file(os.path.join(llvm_path, "libclang.dll"))
             else:
-                print(
-                    "Warning: libclang.dll not found in default path 'C:/Program Files/LLVM/bin'."
-                )
-                # The system might find it anyway if it's in the PATH
+                print("Warning: libclang.dll not found in default path 'C:/Program Files/LLVM/bin'.")
         else:
             # On Linux, try a few common locations for libclang
             libclang_paths = [
@@ -1050,22 +962,17 @@ def main():
             if found_path:
                 clang.cindex.Config.set_library_file(found_path)
             else:
-                print(
-                    "Warning: Could not find libclang.so in common paths. Ensure it is installed and discoverable."
-                )
+                print("Warning: Could not find libclang.so in common paths. Ensure it is installed and discoverable.")
     except clang.cindex.LibclangError as e:
         print(f"Error initializing libclang: {e}")
-        print(
-            "Please ensure LLVM/Clang is installed correctly and its location is known to the system (e.g., in your PATH)."
-        )
+        print("Please ensure LLVM/Clang is installed correctly and its location is known to the system (e.g., in your PATH).")
         sys.exit(1)
 
     index = clang.cindex.Index.create()
 
-    # Add common include paths to help clang find standard headers
+    # Arguments passed to clang for parsing
     args = [
-        "-x",
-        "c++",
+        "-x", "c++",
         "-std=c++17",
         "-D__CODE_GENERATOR__",
         "-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS",
@@ -1088,22 +995,22 @@ def main():
             print(f"Clang Error: {diag.spelling} at {diag.location}")
             has_errors = True
     if has_errors:
-        print(
-            "Clang reported errors while parsing. The generated files may be incorrect."
-        )
+        print("Clang reported errors while parsing. The generated files may be incorrect.")
 
+    # Kick off the generation process
     BindingGenerator(debug).generate(translation_unit.cursor, sFilename)
 
+    # Post-process the generated FFI header to replace all instances of ImVec types
     outDir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "generated")
     file_path = os.path.join(outDir, "imgui_gen.h")
     content = ""
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding='utf-8') as f:
         content = f.read()
 
     content = re.sub(r"\bImVec2\b", "ImVec2_C", content)
     content = re.sub(r"\bImVec4\b", "ImVec4_C", content)
 
-    with open(file_path, "w", encoding="utf-8") as f:
+    with open(file_path, "w", encoding='utf-8') as f:
         f.write(content)
 
     print("SUCCESS!")
